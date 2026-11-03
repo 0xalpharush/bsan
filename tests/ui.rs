@@ -464,6 +464,7 @@ fn main() -> Result<()> {
     }
 
     ui(Mode::Fail, "tests/c/pass", &target, WithCDependencies, tmpdir.path(), false)?;
+    ui(Mode::Fail, "tests/c/fail", &target, WithCDependencies, tmpdir.path(), false)?;
 
     Ok(())
 }
