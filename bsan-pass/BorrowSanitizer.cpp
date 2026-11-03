@@ -52,6 +52,17 @@ static const uint64_t kOmnivalidTag = 0 * kBorTagStride;
 static const uint64_t kInvalidTag = 1 * kBorTagStride;
 static const uint64_t kWildcardTag = 2 * kBorTagStride;
 
+// The high 16 bits of a tag stored in shadow memory may hold a fingerprint of
+// the pointer value that was stored alongside it (see `bsan_shadow.h`). Bit 48
+// marks that a fingerprint is present, and bits [49, 64) hold a hash.
+static const uint64_t kBorTagFingerprintPresent = uint64_t(1) << 48;
+static const uint64_t kBorTagFingerprintMask = ~uint64_t(0) << 48;
+static const uint64_t kBorTagFingerprintHashMask =
+    kBorTagFingerprintMask & ~kBorTagFingerprintPresent;
+static const uint64_t kBorTagFingerprintMultiplier = 0x9E3779B97F4A7C15ULL;
+static const uint64_t kBorTagMetaMask =
+    kBorTagOffsetMask | kBorTagFingerprintMask;
+
 // The number of bytes that can be
 // stored within a TLS array for
 // variadic arguments.
@@ -85,6 +96,16 @@ static cl::opt<bool> ClTrustAlignHints(
              "slightly slower, but it will"
              " be more robust against programs that have alignment-related "
              "undefined behavior."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClCheckStaleProvenance(
+    "bsan-check-stale-provenance",
+    cl::desc(
+        "Record a fingerprint of each pointer value stored to memory "
+        "alongside its provenance. If a load finds a different value, "
+        "then the memory was overwritten by code that did not update "
+        "its provenance (e.g. an uninstrumented library), so the stale "
+        "provenance is discarded instead of being used to check accesses."),
     cl::Hidden, cl::init(true));
 
 static AtomicOrdering addReleaseOrdering(AtomicOrdering A) {
@@ -800,18 +821,22 @@ struct ProvenancePtr {
   // refer to this as the "shift".
   Value *Shift = nullptr;
 
+  // Whether this destination is within shadow memory. Only tags in shadow
+  // memory carry a fingerprint of the pointer value stored with them.
+  bool IsShadow = false;
+
   ProvenancePtr() {}
   ProvenancePtr(Value *Shadow, Value *Origin, bool UpdateRefCt,
-                Value *Shift = nullptr)
+                Value *Shift = nullptr, bool IsShadow = false)
       : ShadowPtr(Shadow), OriginPtr(Origin), UpdateRefCt(UpdateRefCt),
-        Shift(Shift) {}
+        Shift(Shift), IsShadow(IsShadow) {}
 
   // Offsets this pointer by a number of provenance slots,
   // preserving the in-slot shift.
   ProvenancePtr ptradd(IRBuilder<> &IRB, ProvenanceOffset Offset) {
     Value *Shadow = ::ptradd(IRB, ShadowPtr, Offset.Val);
     Value *Origin = ::ptradd(IRB, OriginPtr, Offset.Val);
-    return ProvenancePtr(Shadow, Origin, UpdateRefCt, Shift);
+    return ProvenancePtr(Shadow, Origin, UpdateRefCt, Shift, IsShadow);
   }
 
   // Offsets this pointer by a number of provenance slots.
@@ -881,12 +906,40 @@ struct ProvenancePtr {
     bool UpdateRefCt = !isa<AllocaInst>(getUnderlyingObject(Addr));
 
     Value *Shift = getShift(BS, IRB, Addr, Alignment);
-    return ProvenancePtr(ShadowPtr, OriginPtr, UpdateRefCt, Shift);
+    return ProvenancePtr(ShadowPtr, OriginPtr, UpdateRefCt, Shift,
+                         /*IsShadow=*/true);
   }
 
-  // Write a provenance value to this destination.
+  // Returns the fingerprint bits for a pointer-sized value `Val`, which
+  // must match `TagFingerprint` in the runtime. Returns null if `Val`
+  // cannot be fingerprinted.
+  static Value *getFingerprint(BorrowSanitizer &BS, IRBuilder<> &IRB,
+                               Value *Val) {
+    if (!ClCheckStaleProvenance || !Val)
+      return nullptr;
+    Type *Ty = Val->getType();
+    if (Ty->isPointerTy()) {
+      if (BS.DL->getPointerTypeSizeInBits(Ty) !=
+          BS.IntptrTy->getIntegerBitWidth())
+        return nullptr;
+      Val = IRB.CreatePtrToAddr(Val);
+    } else if (Ty != BS.IntptrTy) {
+      return nullptr;
+    }
+    Value *Hash = IRB.CreateMul(
+        Val, ConstantInt::get(BS.IntptrTy, kBorTagFingerprintMultiplier));
+    Hash = IRB.CreateAnd(
+        Hash, ConstantInt::get(BS.IntptrTy, kBorTagFingerprintHashMask));
+    return IRB.CreateOr(
+        Hash, ConstantInt::get(BS.IntptrTy, kBorTagFingerprintPresent));
+  }
+
+  // Write a provenance value to this destination. If `Val` is the
+  // pointer-sized value being stored to the corresponding application
+  // memory, then its fingerprint is recorded alongside the provenance.
   void store(BorrowSanitizer &BS, IRBuilder<> &IRB, Provenance Prov,
-             AtomicOrdering Ordering = AtomicOrdering::NotAtomic) {
+             AtomicOrdering Ordering = AtomicOrdering::NotAtomic,
+             Value *Val = nullptr) {
     if (Prov.Elems.isVector()) {
       report_fatal_error("Vector provenance is not supported yet");
     }
@@ -915,6 +968,10 @@ struct ProvenancePtr {
       Tag = Prov.Tag;
       if (this->Shift && !match(this->Shift, m_Zero()))
         Tag = IRB.CreateOr(Tag, this->Shift);
+      if (IsShadow) {
+        if (Value *Fingerprint = getFingerprint(BS, IRB, Val))
+          Tag = IRB.CreateOr(Tag, Fingerprint);
+      }
     }
 
     IRB.CreateAlignedStore(Tag, ShadowPtr, kMinProvAlignment);
@@ -1752,13 +1809,20 @@ private:
 
   // Loads a provenance value from shadow memory, storing it into a
   // new slot on the shadow stack.
-  Provenance loadProvenanceFromShadow(
-      IRBuilder<> &IRB, Value *Base, Align Alignment,
-      ElementCount Elems = ElementCount::getFixed(1),
-      AtomicOrdering Ordering = AtomicOrdering::NotAtomic) {
+  // Loads the provenance stored in the shadow of `Base`. If `RawTag` is
+  // non-null, then it receives the tag as it was stored in shadow memory,
+  // which can be passed to `checkFingerprint` once the application value
+  // has been loaded.
+  Provenance
+  loadProvenanceFromShadow(IRBuilder<> &IRB, Value *Base, Align Alignment,
+                           ElementCount Elems = ElementCount::getFixed(1),
+                           AtomicOrdering Ordering = AtomicOrdering::NotAtomic,
+                           Value **RawTag = nullptr) {
     if (Elems.isScalar()) {
       auto ShadowPtr = ProvenancePtr::getPtrToShadow(BS, IRB, Base, Alignment);
       Provenance Stored = ShadowPtr.load(BS, IRB, Elems, Ordering);
+      if (RawTag)
+        *RawTag = Stored.Tag;
       Provenance Prov = checkSlotOffset(IRB, Stored, ShadowPtr.Shift);
       Value *Slot = allocStackSlot(IRB, false);
       ProvenancePtr SlotPtr = ProvenancePtr::getPtr(BS, IRB, Slot);
@@ -1773,16 +1837,43 @@ private:
   // tag does not match, then the pointer was stored at a different address
   // within this slot, so its provenance does not correspond to the bytes
   // being loaded. In that case, we optimistically return omnivalid
-  // provenance. Otherwise, we strip the offset from the tag.
+  // provenance. Otherwise, we strip the offset and fingerprint from the tag.
   Provenance checkSlotOffset(IRBuilder<> &IRB, Provenance Stored,
                              Value *SlotOffset) {
     Value *Mask = ConstantInt::get(BS.IntptrTy, kBorTagOffsetMask);
     Value *StoredOffset = IRB.CreateAnd(Stored.Tag, Mask);
     Value *Matches = IRB.CreateICmpEQ(StoredOffset, SlotOffset);
-    Value *Tag = IRB.CreateAnd(Stored.Tag, IRB.CreateNot(Mask));
+    Value *Tag = IRB.CreateAnd(Stored.Tag,
+                               ConstantInt::get(BS.IntptrTy, ~kBorTagMetaMask));
     Provenance Omnivalid = Provenance::omnivalid(BS);
     return Provenance(IRB.CreateSelect(Matches, Tag, Omnivalid.Tag),
                       IRB.CreateSelect(Matches, Stored.Info, Omnivalid.Info));
+  }
+
+  // Validates provenance loaded from shadow memory against the fingerprint of
+  // the application value `Val` that was loaded from the same location.
+  // `RawTag` is the tag as it was stored in shadow memory. If the stored
+  // fingerprint does not match the value, then the location was overwritten
+  // without its shadow being updated, e.g. by an uninstrumented library
+  // writing a pointer through an out-parameter. The stored provenance
+  // belongs to the previous value, so we discard it, returning omnivalid
+  // provenance. This is the same provenance that the value would have
+  // received if the location's shadow had never been written. Slots without
+  // a fingerprint are left unchanged.
+  Provenance checkFingerprint(IRBuilder<> &IRB, Provenance Prov, Value *RawTag,
+                              Value *Val) {
+    Value *Fingerprint = ProvenancePtr::getFingerprint(BS, IRB, Val);
+    if (!Fingerprint || !RawTag)
+      return Prov;
+    Value *Stored = IRB.CreateAnd(
+        RawTag, ConstantInt::get(BS.IntptrTy, kBorTagFingerprintMask));
+    Value *Unchecked =
+        IRB.CreateICmpEQ(Stored, ConstantInt::get(BS.IntptrTy, 0));
+    Value *Matches = IRB.CreateICmpEQ(Stored, Fingerprint);
+    Value *Keep = IRB.CreateOr(Unchecked, Matches);
+    Provenance Omnivalid = Provenance::omnivalid(BS);
+    return Provenance(IRB.CreateSelect(Keep, Prov.Tag, Omnivalid.Tag),
+                      IRB.CreateSelect(Keep, Prov.Info, Omnivalid.Info));
   }
 
   // Will fail with an error if anything other than a scalar provenance value is
@@ -2040,7 +2131,11 @@ private:
     Value *Operand = CB.getOperand(0);
     Align OperandAlign = Operand->getPointerAlignment(*BS.DL);
     Value *SrcAddr = IRB.CreateAlignedLoad(BS.PtrTy, Operand, OperandAlign);
-    Provenance SrcProv = loadProvenanceFromShadow(IRB, Operand, OperandAlign);
+    Value *RawTag = nullptr;
+    Provenance SrcProv = loadProvenanceFromShadow(
+        IRB, Operand, OperandAlign, ElementCount::getFixed(1),
+        AtomicOrdering::NotAtomic, &RawTag);
+    SrcProv = checkFingerprint(IRB, SrcProv, RawTag, SrcAddr);
 
     RetagInfo RI(&CB);
     Value *ImArrayLen = getLayoutArrayLength(RI.ImArray);
@@ -2055,7 +2150,7 @@ private:
 
     auto ShadowPtr =
         ProvenancePtr::getPtrToShadow(BS, IRB, Operand, OperandAlign);
-    ShadowPtr.store(BS, IRB, RetaggedProv);
+    ShadowPtr.store(BS, IRB, RetaggedProv, AtomicOrdering::NotAtomic, SrcAddr);
   }
 
   void instrumentRetagReg(CallBase &CB) {
@@ -2585,12 +2680,24 @@ private:
     SmallVector<ProvenanceField> Components =
         BS.getProvenanceLayout(LI.getType());
 
+    // A scalar pointer-sized load can be validated against the fingerprint
+    // of the value that was stored with its provenance.
+    bool IsScalar = Components.size() == 1 && Components[0].ByteOffset == 0 &&
+                    Components[0].Elems.isScalar();
+
     Value *Base = LI.getPointerOperand();
     for (const auto &[Idx, Comp] : llvm::enumerate(Components)) {
       Value *ObjAddr = ptradd(IRB, Base, Comp.getByteOffset(BS.IntptrTy));
       Align FieldAlign = Comp.getAlign(LI.getAlign());
+      Value *RawTag = nullptr;
       Provenance Prov = loadProvenanceFromShadow(IRB, ObjAddr, FieldAlign,
-                                                 Comp.Elems, LI.getOrdering());
+                                                 Comp.Elems, LI.getOrdering(),
+                                                 IsScalar ? &RawTag : nullptr);
+      if (IsScalar && RawTag) {
+        IRBuilder<> After(LI.getNextNode());
+        After.SetCurrentDebugLocation(LI.getDebugLoc());
+        Prov = checkFingerprint(After, Prov, RawTag, &LI);
+      }
       ProvMap.setProvenance({&LI, Idx}, Prov);
     }
   }
@@ -2632,19 +2739,28 @@ private:
     TypeSize StoreSize = BS.DL->getTypeStoreSize(Ty);
     Value *TotalSize = IRB.CreateTypeSize(BS.IntptrTy, StoreSize);
 
-    copyProvenance(IRB, Dest, FieldValues, TotalSize, Ordering);
+    // A scalar pointer-sized value is fingerprinted along with its
+    // provenance, so that loads can detect if it is overwritten
+    // without its shadow being updated.
+    Value *ScalarVal = nullptr;
+    if (Fields.size() == 1 && Fields[0].ByteOffset == 0 &&
+        Fields[0].Elems.isScalar())
+      ScalarVal = Val;
+
+    copyProvenance(IRB, Dest, FieldValues, TotalSize, Ordering, ScalarVal);
   }
 
   void copyProvenance(IRBuilder<> &IRB, ProvenancePtr Dest,
                       ArrayRef<std::pair<ProvenanceField, Provenance>> ProvDesc,
                       Value *TotalSize,
-                      AtomicOrdering Ordering = AtomicOrdering::NotAtomic) {
+                      AtomicOrdering Ordering = AtomicOrdering::NotAtomic,
+                      Value *ScalarVal = nullptr) {
     SmallVector<std::tuple<ProvenanceOffset, ProvenanceOffset>> SlotsToClear;
     ProvenanceOffset GapStart(BS.IntptrTy, 0);
 
     for (const auto &[Field, Prov] : ProvDesc) {
       auto [FieldPtr, FieldOffset] = Dest.field(IRB, Field, BS.IntptrTy);
-      FieldPtr.store(BS, IRB, Prov, Ordering);
+      FieldPtr.store(BS, IRB, Prov, Ordering, ScalarVal);
 
       Value *GapSize = IRB.CreateSub(FieldOffset.Val, GapStart.Val);
       if (!match(GapSize, m_Zero()))
