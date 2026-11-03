@@ -979,14 +979,17 @@ private:
     Type *IntptrTy = ptrToIntPtrType(BS, Addr->getType());
     Value *OffsetLong = IRB.CreatePointerCast(Addr, IntptrTy);
 
-    Align AddrAlign = Alignment.valueOrOne();
-    Align CommonAlign = commonAlignment(AddrAlign, kMinProvAlignment.value());
-
-    if (CommonAlign != kMinProvAlignment) {
-      uint64_t Mask = kMinProvAlignment.value() - 1;
-      OffsetLong =
-          IRB.CreateAnd(OffsetLong, constToIntPtr(BS, IntptrTy, ~Mask));
-    }
+    // We always round the address down to its provenance slot, even if
+    // the alignment hint says that it is already aligned. C and C++ code
+    // often accesses under-aligned objects through pointers with a larger
+    // alignment (e.g. packed on-disk structures). If we trusted the hint
+    // for the slot address, then the provenance of such an access would be
+    // read and written across two slots, corrupting the tag and allocation
+    // pointer of the neighboring slot. Only the in-slot offset (see
+    // `getShift`) trusts the hint.
+    (void)Alignment;
+    uint64_t Mask = kMinProvAlignment.value() - 1;
+    OffsetLong = IRB.CreateAnd(OffsetLong, constToIntPtr(BS, IntptrTy, ~Mask));
 
     if (uint64_t AndMask = BS.MapParams->AndMask)
       OffsetLong =
