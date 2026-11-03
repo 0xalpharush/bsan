@@ -133,6 +133,23 @@ static AtomicOrdering addReleaseOrdering(AtomicOrdering A) {
   llvm_unreachable("Unknown ordering");
 }
 
+// Loads may not carry a Release or AcquireRelease ordering. When we read the
+// previous shadow value while instrumenting an atomic store, we downgrade the
+// store ordering to the strongest ordering that is valid for a load. The
+// synchronization that other threads rely on is still provided by the release
+// ordering added to the application store itself; this read only observes the
+// value that is being overwritten.
+static AtomicOrdering addLoadOrdering(AtomicOrdering A) {
+  switch (A) {
+  case AtomicOrdering::Release:
+    return AtomicOrdering::Monotonic;
+  case AtomicOrdering::AcquireRelease:
+    return AtomicOrdering::Acquire;
+  default:
+    return A;
+  }
+}
+
 static Value *ptradd(IRBuilder<> &IRB, Value *Pointer, Value *Offset) {
   if (match(Offset, m_Zero()))
     return Pointer;
@@ -993,6 +1010,9 @@ struct ProvenancePtr {
     if (Elems.isVector()) {
       report_fatal_error("Vector provenance is not supported yet");
     }
+    // A load cannot carry a release ordering, so downgrade it if needed;
+    // otherwise the emitted module fails LLVM verification.
+    Ordering = addLoadOrdering(Ordering);
     LoadInst *Tag =
         IRB.CreateAlignedLoad(BS.IntptrTy, ShadowPtr, kMinProvAlignment);
     Tag->setAtomic(Ordering);
