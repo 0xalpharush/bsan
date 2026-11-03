@@ -108,6 +108,14 @@ static cl::opt<bool> ClCheckStaleProvenance(
         "provenance is discarded instead of being used to check accesses."),
     cl::Hidden, cl::init(true));
 
+static cl::opt<bool> ClExposeOnlyEscaping(
+    "bsan-expose-only-escaping",
+    cl::desc("Only expose the provenance of a pointer cast to an integer if "
+             "the integer may be used to create a pointer. Integers that are "
+             "only compared, or used in arithmetic that is only compared, "
+             "are never exposed."),
+    cl::Hidden, cl::init(true));
+
 static AtomicOrdering addReleaseOrdering(AtomicOrdering A) {
   switch (A) {
   case AtomicOrdering::NotAtomic:
@@ -2887,7 +2895,50 @@ private:
     ProvMap.forwardProvenance(&I, I.getPointerOperand());
   }
 
+  // Returns true if the integer produced by a `ptrtoint` may be used to
+  // create a pointer, either directly or after it leaves this function. An
+  // integer that only flows into comparisons and arithmetic whose results are
+  // themselves only compared (e.g. the null check of an `Option<&T>`, or the
+  // length computation of a slice iterator) cannot be cast back into a
+  // pointer, so exposing its provenance would have no effect, other than
+  // the cost of exposure.
+  static bool addressMayEscape(Instruction *PtrToInt) {
+    constexpr unsigned MaxVisited = 64;
+    SmallVector<Value *, 8> Worklist{PtrToInt};
+    SmallPtrSet<Value *, 16> Visited;
+    while (!Worklist.empty()) {
+      Value *V = Worklist.pop_back_val();
+      if (!Visited.insert(V).second)
+        continue;
+      if (Visited.size() > MaxVisited)
+        return true;
+      for (User *U : V->users()) {
+        if (isa<ICmpInst>(U) || isa<CondBrInst>(U) || isa<SwitchInst>(U))
+          continue;
+        if (auto *Sel = dyn_cast<SelectInst>(U)) {
+          if (Sel->getCondition() != V)
+            Worklist.push_back(Sel);
+          continue;
+        }
+        if (isa<BinaryOperator>(U) || isa<TruncInst>(U) || isa<ZExtInst>(U) ||
+            isa<SExtInst>(U) || isa<PHINode>(U)) {
+          Worklist.push_back(U);
+          continue;
+        }
+        // Anything else (stores, calls, returns, `inttoptr`, aggregates, ...)
+        // may allow the address to be turned back into a pointer.
+        return true;
+      }
+    }
+    return false;
+  }
+
   void visitPtrToIntInst(PtrToIntInst &I) {
+    if (!ClExposeOnlyEscaping || addressMayEscape(&I))
+      exposePtrToInt(I);
+  }
+
+  void exposePtrToInt(PtrToIntInst &I) {
     if (auto Prov = getProvenance(I.getParent(), I.getPointerOperand())) {
       IRBuilder<> IRB(&I);
       IRB.CreateCall(BS.BsanFuncExposeProv, {Prov->Tag, Prov->Info});
