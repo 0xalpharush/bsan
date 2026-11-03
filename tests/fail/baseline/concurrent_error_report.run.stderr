@@ -1,4 +1,4 @@
-error: Undefined Behavior: an access of size 4b at offset 0x4 is out of bounds for ALLOC of size 4b.
+error: Undefined Behavior: an access of 4 bytes at offset 0x4 is out of bounds for ALLOC of size 4 bytes.
   --> bsan/tests/fail/baseline/concurrent_error_report.rs:LL:CC
    |
 LL | unsafe { p.add(1).write(0) }
