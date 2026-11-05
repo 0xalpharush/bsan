@@ -700,6 +700,123 @@ BSAN_ALIGNED_NEW_INTERCEPTOR(_ZnwmSt11align_val_tRKSt9nothrow_t, true,
 BSAN_ALIGNED_NEW_INTERCEPTOR(_ZnamSt11align_val_tRKSt9nothrow_t, true,
                              BSAN_COMMA const void *nothrow, BSAN_COMMA nothrow)
 
+// GNU libstdc++ implements many `std::basic_string` operations out of line in
+// `libstdc++.so` (construction, assignment, appending, replacing, reserving).
+// When it is not instrumented, these write the string's data pointer `_M_p`
+// without updating its shadow. The fingerprint check catches the case where
+// `_M_p` changes to a different value, but not the common same-address-reuse
+// case: a string's heap buffer is freed and a new allocation (or the string's
+// own local buffer) lands at the same address, so `_M_p` is rewritten with a
+// value equal to the old one. The stored fingerprint still matches, so the
+// stale (and often freed or wrong-sized) provenance is reused and a false
+// positive is reported, e.g. duckdb's `StringUtil::EndsWith` and botan's
+// `test_cert_getters`.
+//
+// After each intercepted call we refresh the shadow of `_M_p`. For a heap
+// buffer we install fresh allocation metadata covering the string's capacity,
+// so that in-bounds accesses are accepted and accesses past the end are still
+// reported. For a short string whose data lives in the object's own local
+// buffer we drop the stale provenance, since that buffer is already covered by
+// the object's own allocation.
+
+// Mirrors `std::__cxx11::basic_string<char>` in the C++11 ABI.
+struct BsanString {
+  char *_M_p;
+  SIZE_T _M_string_length;
+  union {
+    char _M_local_buf[16];
+    SIZE_T _M_allocated_capacity;
+  };
+};
+
+static void BsanRefreshStringData(BsanString *self, uptr span) {
+  if (!BsanInited() || !self)
+    return;
+  char *p = self->_M_p;
+  if (!p)
+    return;
+  BlockGC gc;
+  if (p == self->_M_local_buf) {
+    // Short-string data lives inside the object; just drop stale provenance.
+    ClearShadow(&self->_M_p, sizeof(void *));
+  } else {
+    // Heap buffer: give `_M_p` fresh provenance for [p, p + capacity + 1).
+    Provenance prov = BsanAllocateMeta(p, self->_M_allocated_capacity + 1, span);
+    WriteShadow(&self->_M_p, prov);
+    AcquireProvenance(prov);
+  }
+}
+
+#define BSAN_STRING_VOID_INTERCEPTOR(func, PARAMS, ARGS)                       \
+  INTERCEPTOR(void, func, BsanString *self PARAMS) {                           \
+    GET_SPAN;                                                                  \
+    BSAN_ENSURE_REAL(func);                                                    \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      REAL(func)(self ARGS);                                                   \
+    }                                                                          \
+    BsanRefreshStringData(self, span);                                         \
+  }
+
+#define BSAN_STRING_PTR_INTERCEPTOR(func, PARAMS, ARGS)                        \
+  INTERCEPTOR(void *, func, BsanString *self PARAMS) {                         \
+    GET_SPAN;                                                                  \
+    void *res;                                                                 \
+    BSAN_ENSURE_REAL(func);                                                    \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      res = REAL(func)(self ARGS);                                             \
+    }                                                                          \
+    BsanRefreshStringData(self, span);                                         \
+    return res;                                                                \
+  }
+
+// basic_string<char>::_M_construct<const char*>(const char*, const char*, tag)
+// The trailing forward_iterator_tag is an empty type and occupies no argument
+// register in the GNU C++ ABI, so we omit it.
+BSAN_STRING_VOID_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPKcEEvT_S8_St20forward_iterator_tag,
+    BSAN_COMMA const char *beg BSAN_COMMA const char *end,
+    BSAN_COMMA beg BSAN_COMMA end)
+// basic_string<char>::_M_construct<char*>(char*, char*, tag)
+BSAN_STRING_VOID_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag,
+    BSAN_COMMA char *beg BSAN_COMMA char *end, BSAN_COMMA beg BSAN_COMMA end)
+// basic_string<char>::_M_construct(size_type, char)
+BSAN_STRING_VOID_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructEmc,
+    BSAN_COMMA SIZE_T n BSAN_COMMA char c, BSAN_COMMA n BSAN_COMMA c)
+// basic_string<char>::_M_mutate(size_type, size_type, const char*, size_type)
+BSAN_STRING_VOID_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE8_M_mutateEmmPKcm,
+    BSAN_COMMA SIZE_T pos BSAN_COMMA SIZE_T len1 BSAN_COMMA const char *s
+        BSAN_COMMA SIZE_T len2,
+    BSAN_COMMA pos BSAN_COMMA len1 BSAN_COMMA s BSAN_COMMA len2)
+// basic_string<char>::_M_assign(const basic_string&)
+BSAN_STRING_VOID_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE9_M_assignERKS4_,
+    BSAN_COMMA const BsanString *other, BSAN_COMMA other)
+// basic_string<char>::reserve(size_type)
+BSAN_STRING_VOID_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7reserveEm,
+    BSAN_COMMA SIZE_T n, BSAN_COMMA n)
+// basic_string<char>::_M_replace(size_type, size_type, const char*, size_type)
+BSAN_STRING_PTR_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE10_M_replaceEmmPKcm,
+    BSAN_COMMA SIZE_T pos BSAN_COMMA SIZE_T len1 BSAN_COMMA const char *s
+        BSAN_COMMA SIZE_T len2,
+    BSAN_COMMA pos BSAN_COMMA len1 BSAN_COMMA s BSAN_COMMA len2)
+// basic_string<char>::_M_replace_aux(size_type, size_type, size_type, char)
+BSAN_STRING_PTR_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE14_M_replace_auxEmmmc,
+    BSAN_COMMA SIZE_T pos BSAN_COMMA SIZE_T n1 BSAN_COMMA SIZE_T n2
+        BSAN_COMMA char c,
+    BSAN_COMMA pos BSAN_COMMA n1 BSAN_COMMA n2 BSAN_COMMA c)
+// basic_string<char>::_M_append(const char*, size_type)
+BSAN_STRING_PTR_INTERCEPTOR(
+    _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE9_M_appendEPKcm,
+    BSAN_COMMA const char *s BSAN_COMMA SIZE_T n, BSAN_COMMA s BSAN_COMMA n)
+
 #define COMMON_INTERCEPT_FUNCTION(name) BSAN_INTERCEPT_FUNC(name)
 
 #define COMMON_INTERCEPT_FUNCTION_VER(name, ver)                               \
@@ -968,6 +1085,24 @@ void InitializeInterceptors() {
   INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base11_M_transferEPS0_S1_);
   INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base10_M_reverseEv);
   INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base4swapERS0_S1_);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPKcEEvT_S8_St20forward_iterator_tag);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructIPcEEvT_S7_St20forward_iterator_tag);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructEmc);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE8_M_mutateEmmPKcm);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE9_M_assignERKS4_);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7reserveEm);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE10_M_replaceEmmPKcm);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE14_M_replace_auxEmmmc);
+  INTERCEPT_FUNCTION(
+      _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE9_M_appendEPKcm);
 }
 
 } // namespace __bsan
