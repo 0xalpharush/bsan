@@ -459,6 +459,191 @@ BSAN_STRTOI_INTERCEPTOR(unsigned long, __isoc23_wcstoul, wchar_t)
 BSAN_STRTOI_INTERCEPTOR(unsigned long long, __isoc23_wcstoull, wchar_t)
 #endif
 
+// GNU libstdc++ implements the pointer manipulations of `std::set`, `std::map`
+// and `std::list` out of line, in `libstdc++.so`. When it is not instrumented,
+// these functions rewrite node links without updating their shadow, while
+// the rest of each container is inlined into instrumented code. After each
+// call, we clear the shadow of every link that it may have written, so that
+// subsequent loads of these links receive omnivalid provenance instead of
+// the provenance of an unrelated (and often freed) node. This is the same
+// provenance that these links would have if their shadow had never been
+// written.
+
+// If libstdc++ was loaded after we initialized (e.g. with `dlopen`), then
+// our definitions preempt its own, so we resolve the real functions lazily.
+#define BSAN_ENSURE_REAL(func)                                                 \
+  do {                                                                         \
+    if (UNLIKELY(!REAL(func)))                                                 \
+      CHECK(INTERCEPT_FUNCTION(func));                                         \
+  } while (false)
+
+// Mirrors `std::_Rb_tree_node_base`.
+struct BsanRbNode {
+  int color;
+  BsanRbNode *parent;
+  BsanRbNode *left;
+  BsanRbNode *right;
+};
+
+static void BsanClearRbLinks(BsanRbNode *node) {
+  if (node)
+    ClearShadow(&node->parent, 3 * sizeof(void *));
+}
+
+// A rotation rewrites links in its pivot, the parent and child of the pivot,
+// and one grandchild of the pivot. Every pivot ends up on the path between the
+// node where rebalancing began and the root, so clearing the links of each
+// node on this path, along with those of its children and grandchildren,
+// covers every link that rebalancing could have written.
+static void BsanClearRbPath(BsanRbNode *start, BsanRbNode *header) {
+  BlockGC gc;
+  BsanClearRbLinks(header);
+  for (BsanRbNode *n = start; n && n != header; n = n->parent) {
+    BsanClearRbLinks(n);
+    BsanRbNode *children[] = {n->left, n->right};
+    for (BsanRbNode *child : children) {
+      if (!child)
+        continue;
+      BsanClearRbLinks(child);
+      BsanClearRbLinks(child->left);
+      BsanClearRbLinks(child->right);
+    }
+  }
+}
+
+INTERCEPTOR(void,
+            _ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_,
+            bool insert_left, BsanRbNode *x, BsanRbNode *p,
+            BsanRbNode *header) {
+  BSAN_ENSURE_REAL(
+      _ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_);
+  {
+    InterceptorBarrier barrier;
+    REAL(_ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_)(
+        insert_left, x, p, header);
+  }
+  if (BsanInited())
+    BsanClearRbPath(x, header);
+}
+
+INTERCEPTOR(BsanRbNode *,
+            _ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_,
+            BsanRbNode *z, BsanRbNode *header) {
+  // Rebalancing begins at the former parent of the node that takes the
+  // place of `z` in the tree. If `z` has two children, then its successor
+  // takes its place. Otherwise, one of its children does.
+  BsanRbNode *start = z->parent;
+  if (z->left && z->right) {
+    BsanRbNode *succ = z->right;
+    while (succ->left)
+      succ = succ->left;
+    start = succ->parent == z ? succ : succ->parent;
+  }
+  BsanRbNode *res;
+  BSAN_ENSURE_REAL(
+      _ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_);
+  {
+    InterceptorBarrier barrier;
+    res = REAL(_ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_)(
+        z, header);
+  }
+  if (BsanInited()) {
+    BsanClearRbPath(start, header);
+    BlockGC gc;
+    BsanClearRbLinks(z);
+  }
+  return res;
+}
+
+// Mirrors `std::__detail::_List_node_base`.
+struct BsanListNode {
+  BsanListNode *next;
+  BsanListNode *prev;
+};
+
+static void BsanClearListLinks(BsanListNode *node) {
+  if (node)
+    ClearShadow(node, sizeof(BsanListNode));
+}
+
+// Clears the links of each node, and those of its current neighbors.
+static void BsanClearListNeighborhoods(BsanListNode *a,
+                                       BsanListNode *b = nullptr,
+                                       BsanListNode *c = nullptr) {
+  BlockGC gc;
+  BsanListNode *nodes[] = {a, b, c};
+  for (BsanListNode *node : nodes) {
+    if (!node)
+      continue;
+    BsanClearListLinks(node);
+    BsanClearListLinks(node->next);
+    BsanClearListLinks(node->prev);
+  }
+}
+
+#define BSAN_LIST_INTERCEPTORS(ns)                                             \
+  INTERCEPTOR(void, _ZNSt##ns##15_List_node_base7_M_hookEPS0_,                 \
+              BsanListNode *self, BsanListNode *pos) {                         \
+    BSAN_ENSURE_REAL(_ZNSt##ns##15_List_node_base7_M_hookEPS0_);               \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      REAL(_ZNSt##ns##15_List_node_base7_M_hookEPS0_)(self, pos);              \
+    }                                                                          \
+    if (BsanInited())                                                          \
+      BsanClearListNeighborhoods(self);                                        \
+  }                                                                            \
+  INTERCEPTOR(void, _ZNSt##ns##15_List_node_base9_M_unhookEv,                  \
+              BsanListNode *self) {                                            \
+    BsanListNode *next = self->next, *prev = self->prev;                       \
+    BSAN_ENSURE_REAL(_ZNSt##ns##15_List_node_base9_M_unhookEv);                \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      REAL(_ZNSt##ns##15_List_node_base9_M_unhookEv)(self);                    \
+    }                                                                          \
+    if (BsanInited())                                                          \
+      BsanClearListNeighborhoods(next, prev);                                  \
+  }                                                                            \
+  INTERCEPTOR(void, _ZNSt##ns##15_List_node_base11_M_transferEPS0_S1_,         \
+              BsanListNode *self, BsanListNode *first, BsanListNode *last) {   \
+    BSAN_ENSURE_REAL(_ZNSt##ns##15_List_node_base11_M_transferEPS0_S1_);       \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      REAL(_ZNSt##ns##15_List_node_base11_M_transferEPS0_S1_)(self, first,     \
+                                                              last);           \
+    }                                                                          \
+    if (BsanInited())                                                          \
+      BsanClearListNeighborhoods(self, first, last);                           \
+  }                                                                            \
+  INTERCEPTOR(void, _ZNSt##ns##15_List_node_base10_M_reverseEv,                \
+              BsanListNode *self) {                                            \
+    BSAN_ENSURE_REAL(_ZNSt##ns##15_List_node_base10_M_reverseEv);              \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      REAL(_ZNSt##ns##15_List_node_base10_M_reverseEv)(self);                  \
+    }                                                                          \
+    if (BsanInited()) {                                                        \
+      BlockGC gc;                                                              \
+      BsanListNode *node = self;                                               \
+      do {                                                                     \
+        BsanClearListLinks(node);                                              \
+        node = node->next;                                                     \
+      } while (node && node != self);                                          \
+    }                                                                          \
+  }                                                                            \
+  INTERCEPTOR(void, _ZNSt##ns##15_List_node_base4swapERS0_S1_,                 \
+              BsanListNode *a, BsanListNode *b) {                              \
+    BSAN_ENSURE_REAL(_ZNSt##ns##15_List_node_base4swapERS0_S1_);               \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      REAL(_ZNSt##ns##15_List_node_base4swapERS0_S1_)(a, b);                   \
+    }                                                                          \
+    if (BsanInited())                                                          \
+      BsanClearListNeighborhoods(a, b);                                        \
+  }
+
+// `std::list` in the default (C++11) ABI.
+BSAN_LIST_INTERCEPTORS(8__detail)
+
 #define COMMON_INTERCEPT_FUNCTION(name) BSAN_INTERCEPT_FUNC(name)
 
 #define COMMON_INTERCEPT_FUNCTION_VER(name, ver)                               \
@@ -712,6 +897,17 @@ void InitializeInterceptors() {
   BSAN_INTERCEPT_FUNC(__isoc23_wcstoul);
   BSAN_INTERCEPT_FUNC(__isoc23_wcstoull);
 #endif
+
+  // These are only found if libstdc++ is loaded.
+  INTERCEPT_FUNCTION(
+      _ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_);
+  INTERCEPT_FUNCTION(
+      _ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_);
+  INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base7_M_hookEPS0_);
+  INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base9_M_unhookEv);
+  INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base11_M_transferEPS0_S1_);
+  INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base10_M_reverseEv);
+  INTERCEPT_FUNCTION(_ZNSt8__detail15_List_node_base4swapERS0_S1_);
 }
 
 } // namespace __bsan
