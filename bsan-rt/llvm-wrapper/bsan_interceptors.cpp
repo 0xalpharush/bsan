@@ -644,6 +644,62 @@ static void BsanClearListNeighborhoods(BsanListNode *a,
 // `std::list` in the default (C++11) ABI.
 BSAN_LIST_INTERCEPTORS(8__detail)
 
+// Instrumented code calls `operator new` as a trusted allocation function,
+// expecting the provenance of the new allocation in its first return value
+// slot. GNU libstdc++ implements the aligned forms with `posix_memalign`, which
+// returns the allocation through an out-parameter instead, so the return value
+// slot would keep a stale provenance value. We fill it in here instead.
+// If libstdc++ is not loaded (e.g. because these definitions were the only
+// reason to link it), then we allocate the memory ourselves.
+static void *BsanAlignedNewFallback(SIZE_T size, SIZE_T align, bool nothrow) {
+  void *ptr = nullptr;
+  if (align < sizeof(void *))
+    align = sizeof(void *);
+  if (bsan_posix_memalign(&ptr, align, size ? size : 1) != 0)
+    ptr = nullptr;
+  if (!ptr && !nothrow) {
+    Report("ERROR: BorrowSanitizer: aligned operator new failed to allocate "
+           "%zu bytes\n",
+           size);
+    Die();
+  }
+  return ptr;
+}
+
+#define BSAN_ALIGNED_NEW_INTERCEPTOR(func, NOTHROW, PARAMS, ARGS)              \
+  INTERCEPTOR(void *, func, SIZE_T size, SIZE_T align PARAMS) {                \
+    GET_SPAN;                                                                  \
+    if (UNLIKELY(!REAL(func)))                                                 \
+      INTERCEPT_FUNCTION(func);                                                \
+    bool is_inst = BsanInited() && !BlockInterception() && INST_CALLER(func);  \
+    void *ptr;                                                                 \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      ptr = REAL(func) ? REAL(func)(size, align ARGS)                          \
+                       : BsanAlignedNewFallback(size, align, NOTHROW);         \
+    }                                                                          \
+    if (is_inst) {                                                             \
+      if (ptr) {                                                               \
+        BsanAllocateMetaIntoStack(ptr, size, is_inst, span, 0);                \
+      } else {                                                                 \
+        BlockGC gc;                                                            \
+        ClearRetValSlot(0);                                                    \
+      }                                                                        \
+    }                                                                          \
+    return ptr;                                                                \
+  }
+
+// operator new(size_t, align_val_t)
+BSAN_ALIGNED_NEW_INTERCEPTOR(_ZnwmSt11align_val_t, false, , )
+// operator new[](size_t, align_val_t)
+BSAN_ALIGNED_NEW_INTERCEPTOR(_ZnamSt11align_val_t, false, , )
+// operator new(size_t, align_val_t, const nothrow_t &)
+BSAN_ALIGNED_NEW_INTERCEPTOR(_ZnwmSt11align_val_tRKSt9nothrow_t, true,
+                             BSAN_COMMA const void *nothrow, BSAN_COMMA nothrow)
+// operator new[](size_t, align_val_t, const nothrow_t &)
+BSAN_ALIGNED_NEW_INTERCEPTOR(_ZnamSt11align_val_tRKSt9nothrow_t, true,
+                             BSAN_COMMA const void *nothrow, BSAN_COMMA nothrow)
+
 #define COMMON_INTERCEPT_FUNCTION(name) BSAN_INTERCEPT_FUNC(name)
 
 #define COMMON_INTERCEPT_FUNCTION_VER(name, ver)                               \
@@ -899,6 +955,10 @@ void InitializeInterceptors() {
 #endif
 
   // These are only found if libstdc++ is loaded.
+  INTERCEPT_FUNCTION(_ZnwmSt11align_val_t);
+  INTERCEPT_FUNCTION(_ZnamSt11align_val_t);
+  INTERCEPT_FUNCTION(_ZnwmSt11align_val_tRKSt9nothrow_t);
+  INTERCEPT_FUNCTION(_ZnamSt11align_val_tRKSt9nothrow_t);
   INTERCEPT_FUNCTION(
       _ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_);
   INTERCEPT_FUNCTION(
