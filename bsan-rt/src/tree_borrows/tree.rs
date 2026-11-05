@@ -294,7 +294,15 @@ impl LocationState {
         if !transition.is_noop() {
             let node = nodes.get_mut(idx).unwrap();
 
-            if global_ctx.flags.node_debug_info {
+            // A deallocation discards the tree once it succeeds, so its
+            // transitions can never appear in a later diagnostic. If it fails,
+            // the error is reported from the history recorded before it.
+            // Recording them anyway made deallocating allocations with large
+            // trees slow enough to trip `gc_hang_threshold_ms`, since the
+            // deallocating thread cannot reach a safepoint until it finishes.
+            if global_ctx.flags.node_debug_info
+                && !matches!(diagnostics.access_cause, AccessCause::Dealloc)
+            {
                 // Record the event as part of the history.
                 node.debug_info
                     .history
