@@ -380,6 +380,85 @@ INTERCEPTOR(void, miri_promise_symbolic_alignment, void *ptr,
   }
 }
 
+// Uninstrumented library functions that store pointers into instrumented
+// memory do not update its shadow. A later instrumented load would pair the
+// new pointer with whatever provenance was last stored in that location. The
+// instrumentation pass discards such stale provenance when it can detect that
+// the stored value changed (see `kBorTagFingerprintMask`), but it cannot
+// detect when the new pointer happens to be equal to an old one (e.g. a node
+// that was freed and reallocated at the same address). The interceptors below
+// keep shadow memory consistent for common functions of this kind.
+
+// Updates the shadow of `*endptr` after a call to a `strto*` function. The end
+// pointer always points into `nptr`, so if our caller was instrumented, it
+// inherits the provenance that was passed for `nptr`. Otherwise, it is
+// cleared.
+static void BsanSetEndptrProvenance(void *endptr, bool is_inst,
+                                    Provenance nptr_prov) {
+  if (!endptr)
+    return;
+  int saved_errno = errno;
+  {
+    BlockGC gc;
+    if (is_inst)
+      WriteShadow(endptr, nptr_prov);
+    else
+      ClearShadow(endptr, sizeof(void *));
+  }
+  errno = saved_errno;
+}
+
+#define BSAN_STRTO_INTERCEPTOR_IMPL(ret_type, func, char_type, PARAMS, ARGS)   \
+  INTERCEPTOR(ret_type, func, const char_type *nptr,                           \
+              char_type **endptr PARAMS) {                                     \
+    if (!BsanInited())                                                         \
+      return REAL(func)(nptr, endptr ARGS);                                    \
+    bool is_inst = !BlockInterception() && INST_CALLER(func);                  \
+    Provenance nptr_prov = is_inst ? GetParamSlot(0) : OMNIVALID;              \
+    ret_type res;                                                              \
+    {                                                                          \
+      InterceptorBarrier barrier;                                              \
+      res = REAL(func)(nptr, endptr ARGS);                                     \
+    }                                                                          \
+    BsanSetEndptrProvenance(endptr, is_inst, nptr_prov);                       \
+    return res;                                                                \
+  }
+#define BSAN_COMMA ,
+// Floating-point conversions: `(nptr, endptr)`.
+#define BSAN_STRTOF_INTERCEPTOR(ret_type, func, char_type)                     \
+  BSAN_STRTO_INTERCEPTOR_IMPL(ret_type, func, char_type, , )
+// Integer conversions: `(nptr, endptr, base)`.
+#define BSAN_STRTOI_INTERCEPTOR(ret_type, func, char_type)                     \
+  BSAN_STRTO_INTERCEPTOR_IMPL(ret_type, func, char_type, BSAN_COMMA int base,  \
+                              BSAN_COMMA base)
+
+BSAN_STRTOF_INTERCEPTOR(double, strtod, char)
+BSAN_STRTOF_INTERCEPTOR(float, strtof, char)
+BSAN_STRTOF_INTERCEPTOR(long double, strtold, char)
+BSAN_STRTOI_INTERCEPTOR(long, strtol, char)
+BSAN_STRTOI_INTERCEPTOR(long long, strtoll, char)
+BSAN_STRTOI_INTERCEPTOR(unsigned long, strtoul, char)
+BSAN_STRTOI_INTERCEPTOR(unsigned long long, strtoull, char)
+BSAN_STRTOF_INTERCEPTOR(double, wcstod, wchar_t)
+BSAN_STRTOF_INTERCEPTOR(float, wcstof, wchar_t)
+BSAN_STRTOF_INTERCEPTOR(long double, wcstold, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(long, wcstol, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(long long, wcstoll, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(unsigned long, wcstoul, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(unsigned long long, wcstoull, wchar_t)
+#if SANITIZER_LINUX
+// glibc 2.38 redirects the integer conversions to these symbols when
+// compiling for C23, or with `_GNU_SOURCE` (which is the default for C++).
+BSAN_STRTOI_INTERCEPTOR(long, __isoc23_strtol, char)
+BSAN_STRTOI_INTERCEPTOR(long long, __isoc23_strtoll, char)
+BSAN_STRTOI_INTERCEPTOR(unsigned long, __isoc23_strtoul, char)
+BSAN_STRTOI_INTERCEPTOR(unsigned long long, __isoc23_strtoull, char)
+BSAN_STRTOI_INTERCEPTOR(long, __isoc23_wcstol, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(long long, __isoc23_wcstoll, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(unsigned long, __isoc23_wcstoul, wchar_t)
+BSAN_STRTOI_INTERCEPTOR(unsigned long long, __isoc23_wcstoull, wchar_t)
+#endif
+
 #define COMMON_INTERCEPT_FUNCTION(name) BSAN_INTERCEPT_FUNC(name)
 
 #define COMMON_INTERCEPT_FUNCTION_VER(name, ver)                               \
@@ -608,6 +687,31 @@ void InitializeInterceptors() {
   BSAN_INTERCEPT_FUNC(posix_memalign);
   BSAN_INTERCEPT_FUNC(atexit);
   BSAN_INTERCEPT_FUNC(__cxa_atexit);
+
+  BSAN_INTERCEPT_FUNC(strtod);
+  BSAN_INTERCEPT_FUNC(strtof);
+  BSAN_INTERCEPT_FUNC(strtold);
+  BSAN_INTERCEPT_FUNC(strtol);
+  BSAN_INTERCEPT_FUNC(strtoll);
+  BSAN_INTERCEPT_FUNC(strtoul);
+  BSAN_INTERCEPT_FUNC(strtoull);
+  BSAN_INTERCEPT_FUNC(wcstod);
+  BSAN_INTERCEPT_FUNC(wcstof);
+  BSAN_INTERCEPT_FUNC(wcstold);
+  BSAN_INTERCEPT_FUNC(wcstol);
+  BSAN_INTERCEPT_FUNC(wcstoll);
+  BSAN_INTERCEPT_FUNC(wcstoul);
+  BSAN_INTERCEPT_FUNC(wcstoull);
+#if SANITIZER_LINUX
+  BSAN_INTERCEPT_FUNC(__isoc23_strtol);
+  BSAN_INTERCEPT_FUNC(__isoc23_strtoll);
+  BSAN_INTERCEPT_FUNC(__isoc23_strtoul);
+  BSAN_INTERCEPT_FUNC(__isoc23_strtoull);
+  BSAN_INTERCEPT_FUNC(__isoc23_wcstol);
+  BSAN_INTERCEPT_FUNC(__isoc23_wcstoll);
+  BSAN_INTERCEPT_FUNC(__isoc23_wcstoul);
+  BSAN_INTERCEPT_FUNC(__isoc23_wcstoull);
+#endif
 }
 
 } // namespace __bsan
