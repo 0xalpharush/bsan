@@ -1,4 +1,4 @@
-error: Undefined Behavior: an access of size 8b at offset 0x40 is out of bounds for ALLOC of size 40b.
+error: Undefined Behavior: an access of 8 bytes at offset 0x40 is out of bounds for ALLOC of size 64 bytes.
   --> bsan/tests/c/fail/libstdcxx_aligned_new_oob.rs:LL:CC
    |
 LL | uint64_t v = p[8];

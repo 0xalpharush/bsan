@@ -36,7 +36,9 @@ impl ErrorFormatContext {
                 "trying to access an allocation that has been freed.\n".to_string()
             }
             UBInfo::AccessOutOfBounds { alloc_id, access_size, alloc_size, offset } => format!(
-                "an access of size {access_size:x}b at offset 0x{offset:x} is out of bounds for {alloc_id:?} of size {alloc_size:x}b.\n"
+                "an access of {} at offset 0x{offset:x} is out of bounds for {alloc_id:?} of size {}.\n",
+                fmt_bytes(access_size),
+                fmt_bytes(alloc_size),
             ),
             UBInfo::AliasingViolation(error) => {
                 result.push_str(&self.display_tree_error(error, symbol, origin));
@@ -158,5 +160,13 @@ impl ErrorFormatContext {
             Symbol::Unused => (),
         }
         buffer
+    }
+}
+
+/// Formats a size in decimal, with units (e.g. "1 byte", "10 bytes").
+fn fmt_bytes(size: Size) -> String {
+    match size.bytes() {
+        1 => "1 byte".to_string(),
+        n => format!("{n} bytes"),
     }
 }

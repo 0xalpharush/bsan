@@ -1,4 +1,4 @@
-error: Undefined Behavior: an access of size 1b at offset 0x7 is out of bounds for ALLOC of size 4b.
+error: Undefined Behavior: an access of 1 byte at offset 0x7 is out of bounds for ALLOC of size 4 bytes.
   --> bsan/tests/c/fail/strtod_endptr_oob.rs:LL:CC
    |
 LL | char c = end[4];
