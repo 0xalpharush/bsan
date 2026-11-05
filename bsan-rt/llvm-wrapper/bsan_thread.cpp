@@ -117,6 +117,9 @@ BsanThread *BsanThread::Create(const void *start_data, uptr data_size,
 }
 
 void BsanThread::ThreadStart(ThreadID os_id) {
+  // Record the OS thread ID for diagnostics, such as reports of threads that
+  // have not reached a safepoint.
+  this->os_id = os_id;
   Init();
   GetThreadRegistry().StartThread(tid(), os_id, ThreadType::Regular, nullptr);
   if (common_flags()->use_sigaltstack)
