@@ -93,6 +93,19 @@ impl<T> DedupRangeMap<T> {
         self.v.iter_mut().map(|elem| (elem.range.clone(), &mut elem.data))
     }
 
+    /// Mutable iteration over just the data of every element overlapping the
+    /// half-open byte interval, skipping the per-element range clone. Used by GC
+    /// pruning to clear a tag from only the locations within its footprint.
+    pub fn iter_mut_overlapping(&mut self, lo: u64, hi: u64) -> impl Iterator<Item = &mut T> {
+        let start = if lo >= hi {
+            self.v.len()
+        } else {
+            // First element whose range end lies past lo.
+            self.v.partition_point(|elem| elem.range.end <= lo)
+        };
+        self.v[start..].iter_mut().take_while(move |elem| elem.range.start < hi).map(|elem| &mut elem.data)
+    }
+
     /// Provides iteration over all elements.
     /// The iterator also provides the range of the given element.
     /// How exactly the ranges are split can differ even for otherwise identical

@@ -380,7 +380,9 @@ mod tests {
     #[test]
     fn test_sizes() {
         use crate::tree_borrows::tree::{LocationState, Node};
-        assert_eq!(core::mem::size_of::<Node>(), 144);
+        // 144 -> 160: two u64 offsets (perm_lo/perm_hi) plus a flag byte added to
+        // bound GC pruning to the byte range each node actually touched.
+        assert_eq!(core::mem::size_of::<Node>(), 160);
         assert_eq!(core::mem::size_of::<LocationState>(), 3);
         #[cfg(feature = "smallvec-valmap")]
         {

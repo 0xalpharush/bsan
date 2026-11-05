@@ -182,9 +182,31 @@ pub struct Node {
     pub refcount: RefCount,
     /// Some extra information useful only for debugging purposes.
     pub debug_info: NodeDebugInfo,
+    /// Smallest byte offset at which this node has (or had) a per-location
+    /// permission entry, and one past the largest. `perm_lo >= perm_hi` means
+    /// "no entries". This is a conservative *superset* of the locations where
+    /// `perms` holds this node's index; it lets GC pruning clear only the
+    /// locations the node ever touched instead of scanning the whole allocation.
+    pub perm_lo: u64,
+    pub perm_hi: u64,
+    /// Set once this node (or one of its descendants) is exposed, which is the
+    /// only way it can acquire `exposed_cache` entries. While it stays `false`,
+    /// GC pruning can skip the full-allocation `exposed_cache` sweep entirely.
+    pub maybe_exposed_cache: bool,
 }
 
 impl Node {
+    /// Widen the recorded permission footprint to include `[lo, hi)`.
+    #[inline(always)]
+    pub fn note_perm_range(&mut self, lo: u64, hi: u64) {
+        if lo < self.perm_lo {
+            self.perm_lo = lo;
+        }
+        if hi > self.perm_hi {
+            self.perm_hi = hi;
+        }
+    }
+
     pub fn default_location_state(&self) -> LocationState {
         LocationState::new_non_accessed(
             self.default_initial_perm,
@@ -476,6 +498,10 @@ impl EagerTree {
                     protector_kind: None,
                     refcount: RefCount::new(),
                     debug_info,
+                    // The root holds a permission over the whole allocation.
+                    perm_lo: 0,
+                    perm_hi: size.bytes(),
+                    maybe_exposed_cache: false,
                 },
             );
             nodes
@@ -624,9 +650,20 @@ impl EagerTree {
         // before we can safely apply `UniKeyMap::remove` to truly remove
         // this tag from the `tag_mapping`.
         let node = self.nodes.remove(this).unwrap();
-        for (_range, loc) in self.locations.iter_mut_all() {
-            loc.perms.remove(this);
-            loc.exposed_cache.remove(this);
+        // Clear this node's permission entries, but only across the byte range it
+        // actually touched instead of scanning every location of the allocation.
+        if node.perm_lo < node.perm_hi {
+            for loc in self.locations.iter_mut_overlapping(node.perm_lo, node.perm_hi) {
+                loc.perms.remove(this);
+            }
+        }
+        // `exposed_cache` entries can lie outside the permission footprint (a node
+        // is bumped for every exposed descendant, across all locations), so sweep
+        // the whole allocation only when this node could actually carry one.
+        if node.maybe_exposed_cache {
+            for (_range, loc) in self.locations.iter_mut_all() {
+                loc.exposed_cache.remove(this);
+            }
         }
         self.tag_mapping.remove(&node.tag);
     }
@@ -910,6 +947,9 @@ impl LocationTree {
         let node_app = |args: NodeAppArgs<'_, LocationTree>| {
             visit_count += 1;
             let node = args.nodes.get_mut(args.idx).unwrap();
+            if let Some(ar) = diagnostics.access_range {
+                node.note_perm_range(ar.start.bytes(), ar.end().bytes());
+            }
             let mut perm = args.data.perms.entry(args.idx);
 
             let state = perm.or_insert(node.default_location_state());
@@ -1024,6 +1064,9 @@ impl LocationTree {
             |args| {
                 visit_count += 1;
                 let node = args.nodes.get_mut(args.idx).unwrap();
+                if let Some(ar) = diagnostics.access_range {
+                    node.note_perm_range(ar.start.bytes(), ar.end().bytes());
+                }
 
                 let protected = node.protector_kind.is_some();
 
@@ -1336,6 +1379,9 @@ impl Tree for EagerTree {
                 protector_kind: protector,
                 refcount: RefCount::new(),
                 debug_info: NodeDebugInfo::new(new_tag, outside_perm, span),
+                perm_lo: u64::MAX,
+                perm_hi: 0,
+                maybe_exposed_cache: false,
             },
         );
         if let Some(parent_idx) = parent_idx {
@@ -1356,6 +1402,9 @@ impl Tree for EagerTree {
             );
 
             min_sifa = cmp::min(min_sifa, perm.idempotent_foreign_access);
+            let lo = base_offset.bytes() + start;
+            let hi = base_offset.bytes() + end;
+            self.nodes.get_mut(idx).unwrap().note_perm_range(lo, hi);
             for (_range, loc) in self
                 .locations
                 .iter_mut(Size::from_bytes(start) + base_offset, Size::from_bytes(end - start))
@@ -1552,6 +1601,15 @@ impl Tree for EagerTree {
         let node = self.nodes.get_mut(id).unwrap();
         if !node.is_exposed {
             node.is_exposed = true;
+            // Exposing a node creates `exposed_cache` entries for it and every
+            // ancestor, so mark the whole chain; otherwise GC pruning would skip
+            // their sweep and leave stale entries behind.
+            let mut chain = Some(id);
+            while let Some(cid) = chain {
+                let n = self.nodes.get_mut(cid).unwrap();
+                n.maybe_exposed_cache = true;
+                chain = n.parent;
+            }
             let node = self.nodes.get(id).unwrap();
 
             for (_, loc) in self.locations.iter_mut_all() {
