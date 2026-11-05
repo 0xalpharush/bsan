@@ -642,8 +642,8 @@ bool __bsan_rc_inc_impl(BorTag Tag, Block *Info);
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __bsan_rc_inc(BorTag tag, Block *info, void *dest_shadow) {
-  // Tags read from shadow memory may carry a slot offset.
-  tag = STRIP_TAG_OFFSET(tag);
+  // Tags read from shadow memory may carry a slot offset and a fingerprint.
+  tag = STRIP_TAG_META(tag);
   if (!CONCRETE(tag))
     return;
   uptr dest = SHADOW_TO_MEM(dest_shadow);
@@ -670,8 +670,8 @@ bool __bsan_rc_dec_impl(BorTag tag, Block *info);
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __bsan_rc_dec(BorTag tag, Block *info, void *dest_shadow) {
-  // Tags read from shadow memory may carry a slot offset.
-  tag = STRIP_TAG_OFFSET(tag);
+  // Tags read from shadow memory may carry a slot offset and a fingerprint.
+  tag = STRIP_TAG_META(tag);
   if (!CONCRETE(tag))
     return;
   uptr dest = SHADOW_TO_MEM(dest_shadow);

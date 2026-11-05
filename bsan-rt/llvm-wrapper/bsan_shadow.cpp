@@ -261,7 +261,7 @@ ALWAYS_INLINE static void ClearIfOverlapping(uptr slot, uptr dst, uptr size) {
 // and it begins within [lo, hi). Otherwise, returns 0.
 ALWAYS_INLINE static uptr PointerWithin(uptr slot, uptr lo, uptr hi) {
   BorTag tag = *SlotTag(slot);
-  if (STRIP_TAG_OFFSET(tag) == kOmnivalidTag)
+  if (STRIP_TAG_META(tag) == kOmnivalidTag)
     return 0;
   uptr start = slot + (tag & kBorTagOffsetMask);
   return lo <= start && start < hi ? start : 0;
@@ -443,7 +443,11 @@ void WriteShadow(void *dest, Provenance prov) {
     return;
   uptr slot = SlotOf((uptr)dest);
   // Record where the pointer begins within its slot.
-  StoreProvenance(SlotTag(slot), SlotBlock(slot),
-                  prov.tag | ((uptr)dest & kBorTagOffsetMask), prov.block);
+  BorTag tag = prov.tag | ((uptr)dest & kBorTagOffsetMask);
+  // Callers write the pointer before its shadow, so we can fingerprint
+  // the value that is currently in memory.
+  if (tag != kOmnivalidTag)
+    tag |= TagFingerprint(*(const uptr *)dest);
+  StoreProvenance(SlotTag(slot), SlotBlock(slot), tag, prov.block);
 }
 } // namespace __bsan

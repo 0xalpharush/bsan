@@ -35,8 +35,38 @@ static constexpr BorTag kInvalidTag = 1 * kBorTagStride;
 static constexpr BorTag kWildcardTag = 2 * kBorTagStride;
 static constexpr BorTag kFirstConcreteTag = 3 * kBorTagStride;
 
+// The high 16 bits of a tag stored in shadow memory may hold a fingerprint of
+// the pointer value that instrumented code stored alongside it. Bit 48 marks
+// that a fingerprint is present, and bits [49, 64) hold a hash of the value.
+// When an instrumented load finds a fingerprint that does not match the value
+// it loaded, the slot was overwritten by code that did not update its shadow
+// (e.g. an uninstrumented library), so the stored provenance is stale. Like
+// the offset bits, these bits are never set outside of shadow memory, and
+// borrow tags never grow large enough to reach them.
+static constexpr uptr kBorTagFingerprintShift = 48;
+static constexpr BorTag kBorTagFingerprintPresent = (BorTag)1
+                                                    << kBorTagFingerprintShift;
+static constexpr BorTag kBorTagFingerprintMask = ~(BorTag)0
+                                                 << kBorTagFingerprintShift;
+static constexpr BorTag kBorTagFingerprintHashMask =
+    kBorTagFingerprintMask & ~kBorTagFingerprintPresent;
+static constexpr BorTag kBorTagFingerprintMultiplier = 0x9E3779B97F4A7C15ULL;
+static constexpr BorTag kBorTagMetaMask =
+    kBorTagOffsetMask | kBorTagFingerprintMask;
+
+// Computes the fingerprint bits for a pointer value. This must match the
+// computation emitted by the instrumentation pass.
+inline BorTag TagFingerprint(uptr value) {
+  return ((value * kBorTagFingerprintMultiplier) & kBorTagFingerprintHashMask) |
+         kBorTagFingerprintPresent;
+}
+
 #define CONCRETE(tag) ((tag) > kWildcardTag)
+// Strips only the in-slot offset, preserving the fingerprint. Used when
+// shadow is moved together with the bytes that it describes.
 #define STRIP_TAG_OFFSET(tag) ((tag) & ~kBorTagOffsetMask)
+// Strips every bit that is only meaningful within shadow memory.
+#define STRIP_TAG_META(tag) ((tag) & ~kBorTagMetaMask)
 
 struct MappingDesc {
   uptr start;
